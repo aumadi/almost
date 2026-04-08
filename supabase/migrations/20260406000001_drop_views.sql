@@ -1,0 +1,9 @@
+-- Drop all active_ views
+DROP VIEW IF EXISTS public.active_app_settings;
+DROP VIEW IF EXISTS public.active_notifications;
+DROP VIEW IF EXISTS public.active_messages;
+DROP VIEW IF EXISTS public.active_chats;
+DROP VIEW IF EXISTS public.active_connection_requests;
+DROP VIEW IF EXISTS public.active_trip_overlaps;
+DROP VIEW IF EXISTS public.active_trips;
+DROP VIEW IF EXISTS public.active_profiles;
