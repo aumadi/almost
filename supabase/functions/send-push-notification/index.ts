@@ -41,6 +41,7 @@ interface NotificationRecord {
   related_trip_id: string | null;
   related_chat_id: string | null;
   is_read: boolean;
+  unread_count: number;
   created_at: string;
   deleted_at: string | null;
 }
@@ -163,11 +164,18 @@ function buildPushPayload(
         title: "Connection accepted",
         body: `You're connected with ${sender}. Chat is open.`,
       };
-    case "new_message":
-      return {
-        title: sender,
-        body: `New message from ${sender}.`,
-      };
+    case "new_message": {
+      const count = notification.unread_count ?? 1;
+      let body: string;
+      if (count > 9) {
+        body = `9+ new messages from ${sender}.`;
+      } else if (count > 1) {
+        body = `${count} new messages from ${sender}.`;
+      } else {
+        body = `New message from ${sender}.`;
+      }
+      return { title: sender, body };
+    }
     case "trip_starts_tomorrow":
       return {
         title: "Trip reminder",
@@ -189,6 +197,7 @@ Deno.serve(async (req: Request) => {
     const FIREBASE_SERVICE_ACCOUNT_JSON = Deno.env.get(
       "FIREBASE_SERVICE_ACCOUNT_JSON",
     );
+    const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET");
 
     if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
       throw new Error("Missing Supabase environment variables");
@@ -196,12 +205,49 @@ Deno.serve(async (req: Request) => {
     if (!FIREBASE_SERVICE_ACCOUNT_JSON) {
       throw new Error("Missing FIREBASE_SERVICE_ACCOUNT_JSON secret");
     }
+    if (!WEBHOOK_SECRET) {
+      throw new Error("Missing WEBHOOK_SECRET secret");
+    }
+
+    // App-level auth check. Because --no-verify-jwt is on (required for the
+    // new sb_secret_* API key system), the gateway no longer guards this
+    // function — we verify a shared secret in the `apikey` header instead.
+    // Only the Database Webhook (which we control) knows this value.
+    const callerKey = req.headers.get("apikey");
+    if (callerKey !== WEBHOOK_SECRET) {
+      return new Response(
+        JSON.stringify({ error: "unauthorized" }),
+        { status: 401, headers: { "Content-Type": "application/json" } },
+      );
+    }
 
     const payload: WebhookPayload = await req.json();
 
-    if (payload.type !== "INSERT" || payload.table !== "notifications") {
+    if (payload.table !== "notifications") {
       return new Response(
-        JSON.stringify({ skipped: "not a notifications INSERT" }),
+        JSON.stringify({ skipped: "not the notifications table" }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+
+    // INSERT  → always push.
+    // UPDATE  → push only when unread_count went UP (i.e., a fresh message
+    //           coalesced into an existing card). Ignore is_read and
+    //           auto_dismissed_in_chat flips so reads/dismisses don't push.
+    if (payload.type === "INSERT") {
+      // fall through
+    } else if (payload.type === "UPDATE") {
+      const newCount = payload.record?.unread_count ?? 0;
+      const oldCount = payload.old_record?.unread_count ?? 0;
+      if (newCount <= oldCount) {
+        return new Response(
+          JSON.stringify({ skipped: "UPDATE did not increase unread_count" }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+    } else {
+      return new Response(
+        JSON.stringify({ skipped: `event ${payload.type} not handled` }),
         { status: 200, headers: { "Content-Type": "application/json" } },
       );
     }
@@ -274,28 +320,48 @@ Deno.serve(async (req: Request) => {
     const fcmEndpoint =
       `https://fcm.googleapis.com/v1/projects/${serviceAccount.project_id}/messages:send`;
 
+    // For new_message pushes, group banners on the device by chat so the OS
+    // replaces the previous banner for the same chat instead of stacking 11
+    // of them. Android uses collapse_key + notification tag; iOS uses
+    // apns-collapse-id + thread-id.
+    const collapseId =
+      notification.type === "new_message" && notification.related_chat_id
+        ? `chat_${notification.related_chat_id}`
+        : null;
+
     // 5. Send to each device. Soft-delete tokens FCM rejects as invalid.
     const sendResults = await Promise.allSettled(
       devices.map(async (device: { id: string; fcm_token: string }) => {
+        const message: Record<string, unknown> = {
+          token: device.fcm_token,
+          notification: { title, body },
+          data: {
+            notification_id: notification.id,
+            type: notification.type,
+            related_user_id: notification.related_user_id ?? "",
+            related_chat_id: notification.related_chat_id ?? "",
+            related_trip_id: notification.related_trip_id ?? "",
+          },
+        };
+
+        if (collapseId) {
+          message.android = {
+            collapse_key: collapseId,
+            notification: { tag: collapseId },
+          };
+          message.apns = {
+            headers: { "apns-collapse-id": collapseId },
+            payload: { aps: { "thread-id": collapseId } },
+          };
+        }
+
         const fcmResponse = await fetch(fcmEndpoint, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
             Authorization: `Bearer ${accessToken}`,
           },
-          body: JSON.stringify({
-            message: {
-              token: device.fcm_token,
-              notification: { title, body },
-              data: {
-                notification_id: notification.id,
-                type: notification.type,
-                related_user_id: notification.related_user_id ?? "",
-                related_chat_id: notification.related_chat_id ?? "",
-                related_trip_id: notification.related_trip_id ?? "",
-              },
-            },
-          }),
+          body: JSON.stringify({ message }),
         });
 
         if (!fcmResponse.ok) {
