@@ -36,12 +36,16 @@ interface NotificationRecord {
     | "connection_request_received"
     | "connection_accepted"
     | "new_message"
-    | "trip_starts_tomorrow";
+    | "trip_starts_tomorrow"
+    | "admin_warning"
+    | "new_crossed_path"
+    | "crossed_paths_summary";
   related_user_id: string | null;
   related_trip_id: string | null;
   related_chat_id: string | null;
   is_read: boolean;
   unread_count: number;
+  body: string | null;
   created_at: string;
   deleted_at: string | null;
 }
@@ -183,6 +187,29 @@ function buildPushPayload(
           ? `Your trip to ${airportIata} starts tomorrow.`
           : "Your trip starts tomorrow.",
       };
+    case "admin_warning":
+      return {
+        title: "Warning from Almost",
+        body:
+          notification.body ??
+          "Warning: Please review our community guidelines.",
+      };
+    case "new_crossed_path":
+      return {
+        title: "New crossed path",
+        body:
+          notification.body ??
+          `${sender} is on your trip.`,
+      };
+    case "crossed_paths_summary": {
+      const count = notification.unread_count ?? 1;
+      return {
+        title: "New crossed paths",
+        body:
+          notification.body ??
+          `You have ${count} new crossed path${count > 1 ? "s" : ""} from your trip.`,
+      };
+    }
     default:
       return { title: "Almost", body: "You have a new notification." };
   }
@@ -223,7 +250,14 @@ Deno.serve(async (req: Request) => {
 
     const payload: WebhookPayload = await req.json();
 
+    console.log(
+      `[push] received ${payload.type} on ${payload.table}; ` +
+        `notification_id=${payload.record?.id} type=${payload.record?.type} ` +
+        `user_id=${payload.record?.user_id}`,
+    );
+
     if (payload.table !== "notifications") {
+      console.log("[push] skipped: not notifications table");
       return new Response(
         JSON.stringify({ skipped: "not the notifications table" }),
         { status: 200, headers: { "Content-Type": "application/json" } },
@@ -266,7 +300,12 @@ Deno.serve(async (req: Request) => {
       .is("deleted_at", null);
 
     if (devicesError) throw devicesError;
+    console.log(
+      `[push] devices found for user ${notification.user_id}: ` +
+        `${devices?.length ?? 0}`,
+    );
     if (!devices || devices.length === 0) {
+      console.log("[push] skipped: no active devices for user");
       return new Response(
         JSON.stringify({ skipped: "no active devices for user" }),
         { status: 200, headers: { "Content-Type": "application/json" } },
@@ -314,6 +353,7 @@ Deno.serve(async (req: Request) => {
       senderFirstName,
       airportIata,
     );
+    console.log(`[push] payload built: title="${title}" body="${body}"`);
 
     // 4. Mint an FCM access token from the service account.
     const accessToken = await getFcmAccessToken(serviceAccount);
@@ -342,6 +382,19 @@ Deno.serve(async (req: Request) => {
             related_chat_id: notification.related_chat_id ?? "",
             related_trip_id: notification.related_trip_id ?? "",
           },
+          apns: {
+            headers: collapseId
+              ? { "apns-collapse-id": collapseId }
+              : undefined,
+            payload: {
+              aps: {
+                alert: { title, body },
+                sound: "default",
+                "mutable-content": 1,
+                ...(collapseId ? { "thread-id": collapseId } : {}),
+              },
+            },
+          },
         };
 
         if (collapseId) {
@@ -349,11 +402,13 @@ Deno.serve(async (req: Request) => {
             collapse_key: collapseId,
             notification: { tag: collapseId },
           };
-          message.apns = {
-            headers: { "apns-collapse-id": collapseId },
-            payload: { aps: { "thread-id": collapseId } },
-          };
         }
+
+        console.log(
+          `[push] -> FCM device_id=${device.id} token_prefix=${
+            device.fcm_token.slice(0, 12)
+          }... type=${notification.type}`,
+        );
 
         const fcmResponse = await fetch(fcmEndpoint, {
           method: "POST",
@@ -366,6 +421,9 @@ Deno.serve(async (req: Request) => {
 
         if (!fcmResponse.ok) {
           const errorBody = await fcmResponse.text();
+          console.error(
+            `[push] <- FCM ${fcmResponse.status} device_id=${device.id}: ${errorBody}`,
+          );
           // Tokens FCM reports as invalid get soft-deleted so we don't keep
           // trying them. Any 4xx with UNREGISTERED / INVALID_ARGUMENT means
           // the device removed the app or the token rotated.
@@ -388,6 +446,10 @@ Deno.serve(async (req: Request) => {
 
     const sent = sendResults.filter((r) => r.status === "fulfilled").length;
     const failed = sendResults.filter((r) => r.status === "rejected").length;
+
+    console.log(
+      `[push] done: sent=${sent} failed=${failed} total=${devices.length}`,
+    );
 
     return new Response(
       JSON.stringify({ sent, failed, total: devices.length }),
